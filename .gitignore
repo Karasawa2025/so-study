@@ -1,0 +1,17 @@
+# Build outputs
+build/
+*.so
+*.h
+
+# Go
+bin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
