@@ -1,17 +1,13 @@
-// so-proxy-gen: 读取目标 .so 文件的导出符号，生成转发器源代码
+// so-proxy-gen: 读取目标 .so 的导出符号，生成 Go 转发器源码
 //
 // 工作流程:
-//   1. 读取目标 A.so 的 ELF 动态符号表（FUNC 类型）
-//   2. 生成 C 源代码和内联汇编，为每个导出函数创建同名转发桩函数
-//   3. 转发桩在运行时通过 dlopen/dlsym 加载备份的 B.so，将调用原样转发
-//   4. 每次转发前向 stderr 打印一行日志（包含时间戳和函数名）
+//   1. 解析目标 A.so 的 ELF 动态符号表，提取导出函数
+//   2. 生成一个完整的 Go 源文件（proxy.go），使用 cgo + dlopen/dlsym
+//   3. 每个导出函数在 Go 侧通过 //export 导出，内部调用 C trampoline 转发
+//   4. 编译: go build -buildmode=c-shared -o A.so proxy.go
 //
 // 用法:
-//   go run ./cmd/so-proxy-gen -so libtarget.so [-backup libtarget_backup.so] [-out proxy.c]
-//
-// 生成的 proxy.c 使用 x86_64 System V ABI 汇编桩实现参数透传，
-// 保证整数/指针参数（rdi, rsi, rdx, rcx, r8, r9）和浮点参数（xmm0-xmm7）
-// 在转发过程中不被破坏。
+//   go run ./cmd/so-proxy-gen -so libtarget.so [-backup libtarget_backup.so] [-out proxy.go]
 
 package main
 
@@ -28,13 +24,14 @@ import (
 )
 
 type FuncInfo struct {
-	Name string
+	Name  string
+	Index int
 }
 
 func main() {
 	soPath := flag.String("so", "", "目标 .so 文件路径")
 	backupName := flag.String("backup", "", "备份 .so 文件名（默认: 原文件名加 _backup 后缀）")
-	output := flag.String("out", "proxy.c", "输出 C 源文件路径")
+	output := flag.String("out", "", "输出目录路径（默认: 当前目录下的 proxy/ 子目录）")
 	flag.Parse()
 
 	if *soPath == "" {
@@ -52,13 +49,14 @@ func main() {
 		log.Fatalf("无法读取动态符号表: %v", err)
 	}
 
-	// 过滤: 只保留用户导出的函数，排除 Go runtime / cgo 内部符号
+	// 过滤导出函数
 	var funcs []FuncInfo
 	skipPrefixes := []string{
 		"_cgo", "_cgoexp", "crosscall2", "_rt0",
 		"runtime.", "x_cgo", "_Cgo",
 	}
 
+	idx := 0
 	for _, sym := range symbols {
 		if elf.ST_TYPE(sym.Info) != elf.STT_FUNC {
 			continue
@@ -84,12 +82,17 @@ func main() {
 			continue
 		}
 
-		funcs = append(funcs, FuncInfo{Name: sym.Name})
+		funcs = append(funcs, FuncInfo{Name: sym.Name, Index: idx})
+		idx++
 	}
 
 	sort.Slice(funcs, func(i, j int) bool {
 		return funcs[i].Name < funcs[j].Name
 	})
+	// 重新编号
+	for i := range funcs {
+		funcs[i].Index = i
+	}
 
 	if len(funcs) == 0 {
 		log.Fatal("未找到可转发的导出函数")
@@ -109,197 +112,278 @@ func main() {
 		backup = nameNoExt + "_backup" + ext
 	}
 
+	// 确定输出目录
+	outDir := *output
+	if outDir == "" {
+		outDir = "proxy"
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		log.Fatalf("无法创建输出目录 %s: %v", outDir, err)
+	}
+
 	data := struct {
 		OriginalSo string
 		BackupSo   string
 		Functions  []FuncInfo
+		FuncCount  int
 	}{
 		OriginalSo: filepath.Base(*soPath),
 		BackupSo:   backup,
 		Functions:  funcs,
+		FuncCount:  len(funcs),
 	}
 
-	outFile, err := os.Create(*output)
-	if err != nil {
-		log.Fatalf("无法创建输出文件 %s: %v", *output, err)
-	}
-	defer outFile.Close()
+	// 生成 proxy.go
+	writeTemplate(filepath.Join(outDir, "proxy.go"), proxyGoTemplate, data)
+	// 生成 trampoline.c (CGO 内嵌的 C 辅助函数)
+	writeTemplate(filepath.Join(outDir, "trampoline.go"), trampolineGoTemplate, data)
+	// 生成 go.mod
+	writeTemplate(filepath.Join(outDir, "go.mod"), goModTemplate, data)
+	// 生成 Makefile
+	writeTemplate(filepath.Join(outDir, "Makefile"), makefileTemplate, data)
 
-	tmpl, err := template.New("proxy").Parse(proxyTemplate)
-	if err != nil {
-		log.Fatalf("模板解析失败: %v", err)
-	}
-
-	if err := tmpl.Execute(outFile, data); err != nil {
-		log.Fatalf("模板执行失败: %v", err)
-	}
-
-	fmt.Printf("\n已生成转发器源码: %s\n", *output)
-	fmt.Printf("备份 .so 名称: %s\n", backup)
+	fmt.Printf("\n已生成转发器项目: %s/\n", outDir)
 	fmt.Println("\n使用步骤:")
 	fmt.Printf("  1. cp %s %s\n", filepath.Base(*soPath), backup)
-	fmt.Printf("  2. gcc -shared -fPIC -o %s %s -ldl\n", filepath.Base(*soPath), *output)
-	fmt.Printf("  3. 现在 %s 是转发器，调用会自动转发到 %s 并打印日志\n", filepath.Base(*soPath), backup)
+	fmt.Printf("  2. cd %s && make\n", outDir)
+	fmt.Printf("  3. cp %s/%s ./%s\n", outDir, filepath.Base(*soPath), filepath.Base(*soPath))
+	fmt.Printf("  4. 现在 %s 是 Go 转发器，调用会转发到 %s 并打印日志\n",
+		filepath.Base(*soPath), backup)
 }
 
-var proxyTemplate = `/* ============================================================
- * 自动生成的 .so 转发器 (proxy)
- * 原始库: {{.OriginalSo}}
- * 备份库: {{.BackupSo}}
- *
- * 编译: gcc -shared -fPIC -o {{.OriginalSo}} proxy.c -ldl
- *
- * 原理:
- *   每个导出函数被替换为一个转发桩(stub)。桩函数:
- *   1. 首次调用时通过 dlopen 加载备份库 {{.BackupSo}}
- *   2. 通过 dlsym 解析同名符号得到真实函数指针
- *   3. 向 stderr 打印一行日志（时间戳 + 函数名）
- *   4. 跳转到真实函数（使用汇编 jmp 保持参数和栈帧不变）
- *
- * 适用平台: x86_64 Linux (System V ABI)
- * ============================================================ */
+func writeTemplate(path string, tmplStr string, data interface{}) {
+	f, err := os.Create(path)
+	if err != nil {
+		log.Fatalf("无法创建文件 %s: %v", path, err)
+	}
+	defer f.Close()
 
-#define _GNU_SOURCE
+	tmpl, err := template.New(filepath.Base(path)).Parse(tmplStr)
+	if err != nil {
+		log.Fatalf("模板解析失败 (%s): %v", path, err)
+	}
+
+	if err := tmpl.Execute(f, data); err != nil {
+		log.Fatalf("模板执行失败 (%s): %v", path, err)
+	}
+
+	fmt.Printf("  生成: %s\n", path)
+}
+
+// ============================================================
+// Go 模板: proxy.go - 主转发逻辑
+// ============================================================
+var proxyGoTemplate = `package main
+
+// 自动生成的 Go .so 转发器
+// 原始库: {{.OriginalSo}}
+// 备份库: {{.BackupSo}}
+//
+// 编译: CGO_ENABLED=1 go build -buildmode=c-shared -o {{.OriginalSo}} .
+
+/*
 #include <stdio.h>
-#include <stdlib.h>
-#include <dlfcn.h>
-#include <string.h>
 #include <time.h>
-#include <pthread.h>
 
-/* ---- 备份库路径 ---- */
-#define BACKUP_SO_PATH "./{{.BackupSo}}"
-
-/* ---- 全局状态 ---- */
-static void *g_backup_handle = NULL;
-static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
-
-static void get_timestamp(char *buf, size_t len) {
+static void proxy_log(const char *func_name) {
     time_t now = time(NULL);
     struct tm tm_info;
-    localtime_r(&now, &tm_info);
-    strftime(buf, len, "%Y-%m-%d %H:%M:%S", &tm_info);
-}
-
-/* 加载备份库（只执行一次） */
-static void load_backup_library(void) {
-    g_backup_handle = dlopen(BACKUP_SO_PATH, RTLD_NOW);
-    if (!g_backup_handle) {
-        fprintf(stderr, "[so-proxy] FATAL: dlopen(%s) failed: %s\n",
-                BACKUP_SO_PATH, dlerror());
-        abort();
-    }
     char ts[64];
-    get_timestamp(ts, sizeof(ts));
-    fprintf(stderr, "[so-proxy] %s loaded backup library: %s\n", ts, BACKUP_SO_PATH);
+    localtime_r(&now, &tm_info);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_info);
+    fprintf(stderr, "[so-proxy] %s forwarding -> %s()\n", ts, func_name);
+}
+*/
+import "C"
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"unsafe"
+)
+
+// backupSoName 是备份库的文件名
+const backupSoName = "{{.BackupSo}}"
+
+var (
+	initOnce sync.Once
+	// 函数指针缓存
+	funcPtrs [{{.FuncCount}}]unsafe.Pointer
+	funcNames = [{{.FuncCount}}]string{
+		{{- range .Functions}}
+		"{{.Name}}",
+		{{- end}}
+	}
+)
+
+// initBackup 加载备份库并解析所有函数符号
+func initBackup() {
+	initOnce.Do(func() {
+		// 获取自身 .so 所在目录，备份库应在同一目录
+		soDir := "."
+		selfPath, err := os.Executable()
+		if err == nil {
+			soDir = filepath.Dir(selfPath)
+		}
+
+		backupPath := filepath.Join(soDir, backupSoName)
+		// 如果不存在，尝试当前目录
+		if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+			backupPath = "./" + backupSoName
+		}
+
+		handle := dlOpen(backupPath)
+		if handle == nil {
+			fmt.Fprintf(os.Stderr, "[so-proxy] FATAL: 无法加载备份库 %s\n", backupPath)
+			os.Exit(1)
+		}
+
+		fmt.Fprintf(os.Stderr, "[so-proxy] 已加载备份库: %s\n", backupPath)
+
+		// 解析所有函数符号
+		for i, name := range funcNames {
+			ptr := dlSym(handle, name)
+			if ptr == nil {
+				fmt.Fprintf(os.Stderr, "[so-proxy] 警告: 无法解析符号 %s\n", name)
+				continue
+			}
+			funcPtrs[i] = ptr
+		}
+	})
 }
 
-static void ensure_loaded(void) {
-    pthread_once(&g_init_once, load_backup_library);
+// logAndGetPtr 打印日志并返回函数指针
+func logAndGetPtr(index int) unsafe.Pointer {
+	initBackup()
+	cName := C.CString(funcNames[index])
+	C.proxy_log(cName)
+	C.free(unsafe.Pointer(cName))
+	return funcPtrs[index]
 }
 
-/* 解析备份库中的符号 */
-static void* resolve(const char *name) {
-    ensure_loaded();
-    dlerror();
-    void *sym = dlsym(g_backup_handle, name);
+func main() {}
+`
+
+// ============================================================
+// Go 模板: trampoline.go - cgo dlopen/dlsym 封装 + 导出函数桩
+// ============================================================
+var trampolineGoTemplate = `package main
+
+// 自动生成 - 转发桩函数
+
+/*
+#cgo LDFLAGS: -ldl
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+
+// ---- dlopen/dlsym 封装 ----
+static void* proxy_dlopen(const char *path) {
+    void *h = dlopen(path, RTLD_NOW);
+    if (!h) {
+        fprintf(stderr, "[so-proxy] dlopen error: %s\n", dlerror());
+    }
+    return h;
+}
+
+static void* proxy_dlsym(void *handle, const char *name) {
+    dlerror(); // clear
+    void *sym = dlsym(handle, name);
     char *err = dlerror();
     if (err) {
-        fprintf(stderr, "[so-proxy] FATAL: dlsym(%s) failed: %s\n", name, err);
-        abort();
+        fprintf(stderr, "[so-proxy] dlsym error(%s): %s\n", name, err);
+        return NULL;
     }
     return sym;
 }
 
-/* 库卸载清理 */
-__attribute__((destructor))
-static void proxy_fini(void) {
-    if (g_backup_handle) {
-        /* 注意: Go 运行时编译的 .so 不可安全 dlclose，此处仅置空 */
-        g_backup_handle = NULL;
-        fprintf(stderr, "[so-proxy] proxy unloaded\n");
-    }
+// ---- 通用 trampoline: 通过函数指针调用，最多传递 6 个整数/指针参数 ----
+// x86_64 System V ABI: rdi, rsi, rdx, rcx, r8, r9
+// 返回值通过 rax 传回
+
+typedef long long (*fn_ptr_t)(long long, long long, long long, long long, long long, long long);
+
+static long long trampoline_call(void *fn, long long a1, long long a2,
+                                  long long a3, long long a4,
+                                  long long a5, long long a6) {
+    return ((fn_ptr_t)fn)(a1, a2, a3, a4, a5, a6);
 }
 
-/* ============================================================
- * 转发桩函数
- *
- * 方案 A (下方使用): C 函数 + 函数指针调用
- *   优点: 可移植，编译器负责 ABI
- *   限制: 需要知道参数数量上限；此处使用 6 个 long 参数覆盖
- *         x86_64 SysV 前 6 个整数/指针寄存器参数
- *
- * 方案 B (注释中): 纯汇编 jmp 透传
- *   优点: 完美透传任意参数（包括浮点、变参）
- *   限制: 仅 x86_64，需 nasm/gas
- *
- * 如果目标函数签名已知，建议手动将 typedef 改为精确类型。
- * ============================================================ */
-{{range .Functions}}
-/* ---- {{.Name}} ---- */
-typedef long (*pfn_{{.Name}}_t)(long, long, long, long, long, long);
-static pfn_{{.Name}}_t pfn_{{.Name}} = NULL;
-
-__attribute__((visibility("default")))
-long {{.Name}}(long a1, long a2, long a3, long a4, long a5, long a6) {
-    if (__builtin_expect(pfn_{{.Name}} == NULL, 0)) {
-        pfn_{{.Name}} = (pfn_{{.Name}}_t)resolve("{{.Name}}");
-    }
+// 打印转发日志
+static void log_forward(const char *name) {
+    time_t now = time(NULL);
+    struct tm tm_info;
     char ts[64];
-    get_timestamp(ts, sizeof(ts));
-    fprintf(stderr, "[so-proxy] %s forwarding -> {{.Name}}()\n", ts);
-    return pfn_{{.Name}}(a1, a2, a3, a4, a5, a6);
+    localtime_r(&now, &tm_info);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_info);
+    fprintf(stderr, "[so-proxy] %s forwarding -> %s()\n", ts, name);
+}
+*/
+import "C"
+
+import "unsafe"
+
+// ---- dlopen / dlsym Go 封装 ----
+
+func dlOpen(path string) unsafe.Pointer {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	return C.proxy_dlopen(cPath)
+}
+
+func dlSym(handle unsafe.Pointer, name string) unsafe.Pointer {
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	return C.proxy_dlsym(handle, cName)
+}
+
+// ============================================================
+// 转发桩: 每个导出函数对应一个 //export 函数
+//
+// Go 侧通过 //export 导出与原始 .so 相同的符号名。
+// 调用时:
+//   1. 确保备份库已加载（initBackup）
+//   2. 打印日志
+//   3. 通过 C trampoline 调用备份库中的真实函数
+//
+// 参数使用 C.longlong (int64) 作为通用类型，
+// 利用 x86_64 ABI 兼容性传递 int/pointer 类型参数。
+// ============================================================
+{{range .Functions}}
+//export {{.Name}}
+func {{.Name}}(a1, a2, a3, a4, a5, a6 C.longlong) C.longlong {
+	initBackup()
+	cName := C.CString("{{.Name}}")
+	C.log_forward(cName)
+	C.free(unsafe.Pointer(cName))
+	ptr := funcPtrs[{{.Index}}]
+	if ptr == nil {
+		return 0
+	}
+	return C.trampoline_call(ptr, a1, a2, a3, a4, a5, a6)
 }
 {{end}}
+`
 
-/* ============================================================
- * 方案 B: 汇编 jmp 透传 (x86_64)
- * 如需完美透传（包括浮点和变参），取消下方注释并注释掉上方 C 桩。
- * 编译时需加 -DUSE_ASM_STUBS
- * ============================================================
- *
- * #ifdef USE_ASM_STUBS
-{{range .Functions}} *
- * // {{.Name}} 的函数指针（供汇编桩使用）
- * void *g_real_{{.Name}} = NULL;
- *
- * // 初始化函数（首次调用时触发）
- * void __init_{{.Name}}(void) {
- *     g_real_{{.Name}} = resolve("{{.Name}}");
- * }
- *
- * // 汇编桩: 打印日志后 jmp 到真实函数
- * __asm__(
- *     ".globl {{.Name}}\n"
- *     ".type {{.Name}}, @function\n"
- *     "{{.Name}}:\n"
- *     "    push %rdi\n"
- *     "    push %rsi\n"
- *     "    push %rdx\n"
- *     "    push %rcx\n"
- *     "    push %r8\n"
- *     "    push %r9\n"
- *     "    sub  $8, %rsp\n"            // 对齐 16 字节
- *     "    call __log_{{.Name}}\n"      // 打印日志
- *     "    add  $8, %rsp\n"
- *     "    pop  %r9\n"
- *     "    pop  %r8\n"
- *     "    pop  %rcx\n"
- *     "    pop  %rdx\n"
- *     "    pop  %rsi\n"
- *     "    pop  %rdi\n"
- *     "    movq g_real_{{.Name}}(%rip), %rax\n"
- *     "    jmp  *%rax\n"               // 尾调用: 直接跳转
- * );
- *
- * void __log_{{.Name}}(void) {
- *     if (__builtin_expect(g_real_{{.Name}} == NULL, 0))
- *         __init_{{.Name}}();
- *     char ts[64];
- *     get_timestamp(ts, sizeof(ts));
- *     fprintf(stderr, "[so-proxy] %s forwarding -> {{.Name}}()\n", ts);
- * }
-{{end}} *
- * #endif // USE_ASM_STUBS
- */
+// ============================================================
+// go.mod
+// ============================================================
+var goModTemplate = `module so-proxy
+
+go 1.21
+`
+
+// ============================================================
+// Makefile
+// ============================================================
+var makefileTemplate = `.PHONY: build clean
+
+build:
+	CGO_ENABLED=1 go build -buildmode=c-shared -o {{.OriginalSo}} .
+
+clean:
+	rm -f {{.OriginalSo}} *.h
 `

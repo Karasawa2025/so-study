@@ -24,20 +24,21 @@ go build -o "${BUILD_DIR}/so-proxy-gen" ./cmd/so-proxy-gen
 echo "      => ${BUILD_DIR}/so-proxy-gen"
 echo ""
 
-# 3. 备份原始 .so
-echo "[3/5] 备份: libtarget.so -> libtarget_backup.so ..."
+# 3. 备份 + 生成转发器
+echo "[3/5] 备份并生成 Go 转发器源码 ..."
 cp "${BUILD_DIR}/libtarget.so" "${BUILD_DIR}/libtarget_backup.so"
-echo ""
-
-# 4. 生成并编译转发器
-echo "[4/5] 生成转发器 ..."
 "${BUILD_DIR}/so-proxy-gen" \
     -so "${BUILD_DIR}/libtarget.so" \
     -backup libtarget_backup.so \
-    -out "${BUILD_DIR}/proxy.c"
+    -out "${BUILD_DIR}/proxy"
 echo ""
-echo "      编译转发器替换 libtarget.so ..."
-gcc -shared -fPIC -o "${BUILD_DIR}/libtarget.so" "${BUILD_DIR}/proxy.c" -ldl
+
+# 4. 编译 Go 转发器
+echo "[4/5] 编译 Go 转发器 ..."
+cd "${BUILD_DIR}/proxy"
+CGO_ENABLED=1 go build -buildmode=c-shared -o ../libtarget.so .
+cd ../..
+echo "      => ${BUILD_DIR}/libtarget.so (转发器)"
 echo ""
 
 # 5. 测试

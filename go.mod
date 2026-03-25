@@ -1,3 +1,3 @@
-module github.com/perplexity-ai-aoyama-9527-me/so-study
+module github.com/Karasawa2025/so-study
 
 go 1.21
